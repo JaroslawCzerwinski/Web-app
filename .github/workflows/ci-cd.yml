@@ -1,0 +1,159 @@
+name: "Web-App-Deployment"
+on:
+  push:
+    branches:
+      - main
+
+env:
+  REGION: eu-central-1
+  APPLICATION_NAME: web-app
+  WEB_APP_INFRA_DIR: Infra/02-Web-app-infra
+  WEB_APP_DEPLOY_DIR: Infra/03-Web-app-deployment
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.app_version.outputs.APP_VERSION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set ${{ env.APPLICATION_NAME }} version
+        id: app_version
+        run: |
+          APP_VERSION=$(grep -oP '(?<=version )[\d.]+(?=</h1>)' index.html)
+          echo "${{ env.APPLICATION_NAME }} version: $APP_VERSION"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Docker build
+        run: |
+          docker build -t ${{ env.APPLICATION_NAME }}:$APP_VERSION .
+
+      - name: Run Docker container
+        run: |
+          docker run -d -p 80:80 --name ${{ env.APPLICATION_NAME }} ${{ env.APPLICATION_NAME }}:$APP_VERSION
+
+      - name: Test the application
+        run: |
+          sleep 2
+          HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://localhost:80)
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "Application is running"
+          else
+            echo "Application not running, $HTTP_STATUS"
+            exit 1
+          fi
+
+      - name: Push to ECR
+        uses: jwalton/gh-ecr-push@v2
+        with:
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ env.REGION }}
+          local-image: ${{ env.APPLICATION_NAME }}:$APP_VERSION
+          image: ${{ env.APPLICATION_NAME }}:$APP_VERSION
+     
+  deploy-infra:
+    name: Deploy infra
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      
+      - name: Set user_data_script repo-address
+        uses: richardrigutins/replace-in-files@v2
+        with:
+          files: '${{ env.WEB_APP_INFRA_DIR }}/script/user_data_script.sh'
+          search-text: 'REPO-ADDRESS'
+          replacement-text: '${{ github.repository }}'
+        
+      - name: Set user_data_script Token
+        uses: richardrigutins/replace-in-files@v2
+        with:
+          files: '${{ env.WEB_APP_INFRA_DIR }}/script/user_data_script.sh'
+          search-text: 'TOKEN'
+          replacement-text: '${{ secrets.SELF_HOSTED_RUNNER_TOKEN }}'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.2.8
+      
+      - name: Terraform init
+        run: terraform -chdir=${{ env.WEB_APP_INFRA_DIR }} init
+
+      - name: Terraform apply
+        run: terraform -chdir=${{ env.WEB_APP_INFRA_DIR }} apply -auto-approve
+
+  deploy-app:
+    name: Deploy app
+    needs: 
+      - build
+      - deploy-infra
+    runs-on: self-hosted
+    steps:
+     
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}  
+          aws-region: ${{ env.REGION }}
+
+      - name: Get login password to AWS ECR
+        run: aws ecr get-login-password --region ${{ env.REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.REGION }}.amazonaws.com
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.2.8
+      
+      - name: Terraform init
+        run: terraform -chdir=${{ env.WEB_APP_DEPLOY_DIR }} init
+
+      - name: Terraform apply
+        run: terraform -chdir=${{ env.WEB_APP_DEPLOY_DIR }} apply --var="web_app_version=${{ needs.build.outputs.app_version }}" -auto-approve
+
+  test-app:
+    name: Test app
+    needs: deploy-app
+    runs-on: ubuntu-latest
+    steps:
+    
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}  
+          aws-region: ${{ env.REGION }}
+
+      - name: Test the application
+        run: |
+          sleep 30
+          WEB_APP_ADDRESS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?starts_with(LoadBalancerName, '${{ env.APPLICATION_NAME }}')].{DNSName: DNSName}" --output text)
+          echo "Web app address: $WEB_APP_ADDRESS"
+          HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" "$WEB_APP_ADDRESS")
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "Application is running"
+          else
+            echo "Application not running, $HTTP_STATUS"
+            exit 1
+          fi
+    
